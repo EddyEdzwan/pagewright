@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Pagewright" />
+  <meta name="theme-color" content="#24272e" />
+  <link rel="manifest" href="../manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="../icons/apple-touch-icon.png" />
+  <title>Pagewright</title>
+  <link rel="stylesheet" href="../node_modules/pdfjs-dist/web/pdf_viewer.css" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="../node_modules/pdf-lib/dist/pdf-lib.min.js"></script>
+  <script src="../node_modules/@pdf-lib/fontkit/dist/fontkit.umd.min.js"></script>
+  <script src="../node_modules/tesseract.js/dist/tesseract.min.js"></script>
+  <script src="host-web.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header id="topbar">
+    <div class="group">
+      <button data-cmd="toggleSidebar" data-icon="sidebar" title="Pages sidebar" class="sb-toggle"></button>
+      <button data-cmd="open" data-icon="open" title="Open (⌘O)"></button>
+      <button data-cmd="save" data-icon="save" title="Save (⌘S)"></button>
+      <button data-cmd="print" data-icon="print" title="Print (⌘P)"></button>
+      <span class="sep"></span>
+      <button data-cmd="undo" data-icon="undo" title="Undo (⌘Z)"></button>
+      <button data-cmd="redo" data-icon="redo" title="Redo (⇧⌘Z)"></button>
+    </div>
+    <div class="group tools" id="tools">
+      <button data-tool="select" data-icon="select" title="Select / move (V)"></button>
+      <button data-tool="hand" data-icon="hand" title="Pan (H)"></button>
+      <span class="sep"></span>
+      <button data-tool="highlight" data-icon="highlight" title="Highlight text (drag over text)"></button>
+      <button data-tool="underline" data-icon="underline" title="Underline text"></button>
+      <button data-tool="strike" data-icon="strike" title="Strikethrough text"></button>
+      <button data-tool="note" data-icon="note" title="Sticky note comment"></button>
+      <span class="sep"></span>
+      <button data-tool="text" data-icon="text" title="Add text (T)"></button>
+      <button data-tool="edittext" data-icon="edittext" title="Edit existing text (click a line)"></button>
+      <button data-tool="ink" data-icon="pen" title="Draw (P)"></button>
+      <button data-tool="rect" data-icon="rect" title="Rectangle"></button>
+      <button data-tool="ellipse" data-icon="ellipse" title="Ellipse"></button>
+      <button data-tool="line" data-icon="line" title="Line"></button>
+      <button data-tool="arrow" data-icon="arrow" title="Arrow"></button>
+      <span class="sep"></span>
+      <button data-tool="whiteout" data-icon="whiteout" title="White-out (cover content)"></button>
+      <button data-cmd="image" data-icon="image" title="Insert image"></button>
+      <button data-cmd="signature" data-icon="sign" title="Sign"></button>
+      <button data-cmd="stamp" data-icon="stamp" title="Stamp"></button>
+      <button data-tool="redact" data-icon="redact" title="Redact (permanently removes content on save)"></button>
+    </div>
+    <div class="group right">
+      <button data-cmd="zoomOut" data-icon="minus" title="Zoom out"></button>
+      <select id="zoomSel" title="Zoom">
+        <option value="fit">Fit width</option><option value="page">Fit page</option>
+        <option value="0.5">50%</option><option value="0.75">75%</option><option value="1">100%</option>
+        <option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option><option value="3">300%</option>
+        <option value="custom" hidden>—</option>
+      </select>
+      <button data-cmd="zoomIn" data-icon="plus" title="Zoom in"></button>
+      <span class="sep"></span>
+      <input id="pageInput" type="text" value="0" title="Page" /><span id="pageCount">/ 0</span>
+      <span class="sep"></span>
+      <button data-cmd="find" data-icon="search" title="Find (⌘F)"></button>
+      <button data-cmd="organize" data-icon="grid" title="Organize pages"></button>
+      <button id="moreBtn" data-icon="more" title="More tools"></button>
+    </div>
+  </header>
+
+  <div id="propbar">
+    <span id="toolLabel">Select</span>
+    <label class="prop" data-for="color">Color <input type="color" id="pColor" value="#d32f2f" /></label>
+    <label class="prop" data-for="fill">Fill <input type="checkbox" id="pFillOn" /> <input type="color" id="pFill" value="#ffeb3b" /></label>
+    <label class="prop" data-for="width">Stroke <input type="range" id="pWidth" min="0.5" max="12" step="0.5" value="2" /><output id="pWidthOut">2</output></label>
+    <label class="prop" data-for="opacity">Opacity <input type="range" id="pOpacity" min="0.1" max="1" step="0.05" value="1" /></label>
+    <label class="prop" data-for="font">Font
+      <select id="pFont"><option value="Helvetica">Helvetica</option><option value="Times">Times</option><option value="Courier">Courier</option></select>
+      <button id="pBold" class="toggle" title="Bold"><b>B</b></button>
+      <button id="pItalic" class="toggle" title="Italic"><i>I</i></button>
+    </label>
+    <label class="prop" data-for="size">Size <input type="number" id="pSize" min="4" max="200" value="14" /></label>
+    <span class="spacer"></span>
+    <button class="prop danger" data-for="delete" id="pDelete">Delete</button>
+    <span id="formBadge" hidden>This document has fillable form fields</span>
+  </div>
+
+  <main>
+    <aside id="sidebar">
+      <nav class="tabs">
+        <button data-tab="thumbs" class="active">Pages</button>
+        <button data-tab="outline">Bookmarks</button>
+        <button data-tab="comments">Comments</button>
+      </nav>
+      <div id="tab-thumbs" class="tabpane active"><div id="thumbs"></div></div>
+      <div id="tab-outline" class="tabpane"><div id="outline" class="empty-note">No bookmarks</div></div>
+      <div id="tab-comments" class="tabpane"><div id="comments" class="empty-note">No comments</div></div>
+    </aside>
+    <section id="viewer" tabindex="0">
+      <div id="pages"></div>
+      <div id="empty">
+        <div class="drop">
+          <div class="big" data-icon="doc"></div>
+          <h1>Pagewright</h1>
+          <p>Drop a PDF here, or</p>
+          <button class="primary" data-cmd="open">Open a PDF…</button>
+          <p class="hint">Read, annotate, edit text, sign, fill forms, organise pages, merge, split, OCR, compress, redact — all on your device, offline.</p>
+        </div>
+      </div>
+    </section>
+    <section id="organizer" hidden>
+      <div class="org-bar">
+        <strong>Organize pages</strong>
+        <span id="orgSelCount" class="muted"></span>
+        <span class="spacer"></span>
+        <button data-org="selectAll">Select all</button>
+        <button data-org="left" data-icon="left" title="Move earlier"></button>
+        <button data-org="right" data-icon="right" title="Move later"></button>
+        <button data-org="rotL" data-icon="rotl" title="Rotate left"></button>
+        <button data-org="rotR" data-icon="rotr" title="Rotate right"></button>
+        <button data-org="dup">Duplicate</button>
+        <button data-org="blank">Insert blank</button>
+        <button data-org="insert">Insert from file…</button>
+        <button data-org="extract">Extract selected…</button>
+        <button data-org="delete" class="danger">Delete</button>
+        <button data-org="close" class="primary">Done</button>
+      </div>
+      <div id="orgGrid"></div>
+    </section>
+  </main>
+
+  <div id="findbar" hidden>
+    <input id="findInput" placeholder="Find in document" />
+    <label><input type="checkbox" id="findCase" /> Aa</label>
+    <span id="findCount"></span>
+    <button data-find="prev" data-icon="up" title="Previous (⇧↩)"></button>
+    <button data-find="next" data-icon="down" title="Next (↩)"></button>
+    <button data-find="close" data-icon="x" title="Close"></button>
+  </div>
+
+  <div id="menuPop" class="popmenu" hidden>
+    <button data-cmd="combine">Combine files…</button>
+    <button data-cmd="split">Split document…</button>
+    <button data-cmd="compress">Compress…</button>
+    <hr />
+    <button data-cmd="ocr">Recognize text (OCR)…</button>
+    <button data-cmd="toggleFlatten" id="flattenItem">Flatten form fields on save</button>
+    <button data-cmd="applyRedactions">Apply redactions now</button>
+    <hr />
+    <button data-cmd="exportImages">Export pages as images…</button>
+    <button data-cmd="exportText">Export text…</button>
+    <button data-cmd="saveAs">Save as…</button>
+    <hr />
+    <button data-cmd="properties">Document properties…</button>
+    <button data-cmd="licenses">Open-source licenses</button>
+  </div>
+
+  <div id="modalBack" hidden><div id="modal"></div></div>
+  <div id="toast" hidden></div>
+  <div id="busy" hidden><div class="spinner"></div><div id="busyText">Working…</div></div>
+  <div id="printArea"></div>
+</body>
+</html>
