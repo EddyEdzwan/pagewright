@@ -287,6 +287,7 @@ async function renderView(v) {
     const textLayer = new pdfjsLib.TextLayer({ textContentSource: pp.streamTextContent({ includeMarkedContent: true, disableNormalization: true }), container: tl, viewport: vp });
     await textLayer.render();
     const eoc = document.createElement('div'); eoc.className = 'endOfContent'; tl.append(eoc);
+    textRuns(p); textGlyphs(p); // warm caches so text tools respond within the tap
     const annots = await pp.getAnnotations({ intent: 'display' });
     if (annots.length && views.get(p.uid) === v) {
       const ad = $('.annotationLayer', el);
@@ -508,6 +509,7 @@ export function setTool(t) {
   if (TOOL_COLORS[t]) P.color = TOOL_COLORS[t];
   if (!['select', 'hand'].includes(t)) select(null);
   window.getSelection()?.removeAllRanges();
+  $$('.pg .hit').forEach((h) => { h.style.cursor = ''; });
   updateProps();
 }
 
@@ -606,6 +608,8 @@ pagesEl.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   const pgEl = e.target.closest('.pg');
   if (!pgEl || e.target.closest('.text-editor, .note-pop')) return;
+  // A tap outside an open text editor just finishes the edit (tools cancel the default, so blur wouldn't fire).
+  if (activeEditor) { e.preventDefault(); closeEditors(); return; }
   const v = views.get(pgEl.dataset.uid);
   const t = S.tool;
   if (t === 'hand') return e.pointerType === 'touch' ? undefined : startPan(e); // touch already scrolls natively
@@ -619,17 +623,13 @@ pagesEl.addEventListener('pointerdown', (e) => {
     if (S.sel) select(null);
     return; // fall through to native text selection / form fields
   }
-  if (['highlight', 'underline', 'strike'].includes(t)) {
-    // Mouse: select real text (handled on pointerup). Touch: long-press selection is awkward, so drag a box instead.
-    if (e.pointerType !== 'touch' && e.target.closest('.textLayer span')) return;
-    e.preventDefault();
-    return startDraw(e, v, t);
-  }
   if (!e.target.classList.contains('hit')) return;
   e.preventDefault();
+  if (['highlight', 'underline', 'strike'].includes(t)) return startMarkup(e, v, t);
   if (t === 'text') return createText(v, userPt(v, e));
   if (t === 'note') return createNote(v, userPt(v, e));
-  if (t === 'edittext') return editExistingText(v, userPt(v, e));
+  // Open on release, synchronously, so iOS treats focusing the editor as part of the tap and shows the keyboard.
+  if (t === 'edittext') return trackDrag(() => {}, (m) => { if (Math.hypot(m.clientX - e.clientX, m.clientY - e.clientY) < 10) editExistingText(v, userPt(v, m)); });
   if (t === 'place') return placePending(v, userPt(v, e));
   startDraw(e, v, t);
 });
@@ -725,35 +725,106 @@ function startDraw(e, v, tool) {
   });
 }
 
-// Text-selection markup (highlight/underline/strike over real text).
-document.addEventListener('pointerup', () => {
-  if (!['highlight', 'underline', 'strike'].includes(S.tool)) return;
-  setTimeout(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || !sel.rangeCount) return;
-    const range = sel.getRangeAt(0);
-    const byPage = new Map();
-    const rects = [...range.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5);
-    for (const r of rects) {
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-      for (const v of views.values()) {
-        const b = v.el.getBoundingClientRect();
-        if (cx < b.left || cx > b.right || cy < b.top || cy > b.bottom) continue;
-        if (r.height > b.height * 0.2) break; // stray full-page rect from layer containers
-        const a = v.vp.convertToPdfPoint(r.left - b.left, r.top - b.top);
-        const c = v.vp.convertToPdfPoint(r.right - b.left, r.bottom - b.top);
-        const q = { x: Math.min(a[0], c[0]), y: Math.min(a[1], c[1]), w: Math.abs(a[0] - c[0]), h: Math.abs(a[1] - c[1]) };
-        if (!byPage.has(v)) byPage.set(v, []);
-        byPage.get(v).push(q);
-        break;
-      }
-    }
-    sel.removeAllRanges();
-    for (const [v, qs] of byPage) {
-      addObject(v.p, { type: S.tool, color: P.color, opacity: S.tool === 'highlight' ? (P.opacity < 1 ? P.opacity : 0.4) : 1, rects: mergeRects(qs) }, { selectIt: false });
-    }
-  }, 0);
+// Text markup (highlight/underline/strike): press on text and drag, and the mark snaps to the characters in
+// reading order, like selecting text. Click without dragging marks one word. Off text (or on a scanned page) it drags a box.
+function startMarkup(e, v, tool) {
+  const items = glyphCache.get(glyphKey(v.p));
+  if (!items) textGlyphs(v.p);
+  const a = items && glyphAt(items, userPt(v, e), 4);
+  if (!a) return startDraw(e, v, tool);
+  const o = { id: O.newId(), type: tool, color: P.color, opacity: tool === 'highlight' ? (P.opacity < 1 ? P.opacity : 0.4) : 1, rects: [] };
+  const snap = snapshot();
+  v.p.objs.push(o);
+  let moved = false;
+  trackDrag((m) => {
+    if (!moved && Math.hypot(m.clientX - e.clientX, m.clientY - e.clientY) < 4) return;
+    moved = true;
+    o.rects = glyphRects(items, a, glyphAt(items, userPt(v, m), Infinity));
+    drawOverlay(v);
+  }, () => {
+    if (!moved) o.rects = glyphRects(items, ...wordAround(items[a.i], a));
+    if (!o.rects.length) { v.p.objs = v.p.objs.filter((q) => q !== o); drawOverlay(v); return; }
+    drawOverlay(v);
+    pushUndo(snap);
+    refreshComments();
+  });
+}
+
+// Show a text cursor over text and a crosshair elsewhere while a markup tool is active.
+pagesEl.addEventListener('pointermove', (e) => {
+  if (!['highlight', 'underline', 'strike'].includes(S.tool) || e.buttons || !e.target.classList.contains('hit')) return;
+  const v = views.get(e.target.closest('.pg').dataset.uid);
+  const items = v && glyphCache.get(glyphKey(v.p));
+  e.target.style.cursor = items && glyphAt(items, userPt(v, e), 4) ? 'text' : 'crosshair';
 });
+
+// Per-character geometry of the page's text items, in content order. Character advances are measured with the
+// browser's font and scaled to each item's real width, which is close enough to snap to.
+const glyphCache = new Map();
+const glyphKey = (p) => `${p.src}:${p.idx}`;
+const measureCtx = document.createElement('canvas').getContext('2d');
+async function textGlyphs(p) {
+  const key = glyphKey(p);
+  if (glyphCache.has(key)) return glyphCache.get(key);
+  const tc = await pageProxy(p).getTextContent({ disableNormalization: true });
+  const items = [];
+  for (const it of tc.items) {
+    if (!it.str?.trim() || !it.transform || !it.width) continue;
+    const [a, b, , , e, f] = it.transform;
+    const size = Math.hypot(a, b);
+    if (!size) continue;
+    const chars = [...it.str];
+    measureCtx.font = `100px ${tc.styles[it.fontName]?.fontFamily || 'sans-serif'}`;
+    const xs = [0];
+    for (const ch of chars) xs.push(xs[xs.length - 1] + measureCtx.measureText(ch).width);
+    const k = it.width / (xs[xs.length - 1] || 1);
+    items.push({ x: e, y: f, size, rot: Math.round((Math.atan2(b, a) * 180) / Math.PI), w: it.width, chars, xs: xs.map((q) => q * k) });
+  }
+  glyphCache.set(key, items);
+  return items;
+}
+
+/** Nearest caret position {i: item, c: boundary 0..n} to a user-space point, or null if farther than `slop`. */
+function glyphAt(items, [ux, uy], slop) {
+  let best = null, bestD = Infinity;
+  items.forEach((g, i) => {
+    const [lx, ly] = O.toLocal(g.x, g.y, g.rot, ux, uy);
+    const lo = -g.size * 0.25, hi = g.size * 0.95;
+    const dx = lx < 0 ? -lx : lx > g.w ? lx - g.w : 0;
+    const dy = ly < lo ? lo - ly : ly > hi ? ly - hi : 0;
+    const d = Math.hypot(dx, dy * 3); // prefer the line under the pointer over a neighbour to the side
+    if (d < bestD) { bestD = d; best = { i, lx }; }
+  });
+  if (!best || bestD > slop) return null;
+  const xs = items[best.i].xs;
+  let c = 0;
+  while (c < xs.length - 1 && Math.abs(xs[c + 1] - best.lx) <= Math.abs(xs[c] - best.lx)) c++;
+  return { i: best.i, c };
+}
+
+function wordAround(g, { i, c }) {
+  const isWord = (ch) => ch && /\S/.test(ch);
+  let s = Math.min(c, g.chars.length - 1), t = s;
+  if (!isWord(g.chars[s]) && isWord(g.chars[s - 1])) s = t = s - 1;
+  while (s > 0 && isWord(g.chars[s - 1])) s--;
+  while (t < g.chars.length && isWord(g.chars[t])) t++;
+  return [{ i, c: s }, { i, c: t }];
+}
+
+function glyphRects(items, a, b) {
+  if (a.i > b.i || (a.i === b.i && a.c > b.c)) [a, b] = [b, a];
+  const out = [];
+  for (let i = a.i; i <= b.i; i++) {
+    const g = items[i];
+    const c0 = i === a.i ? a.c : 0, c1 = i === b.i ? b.c : g.chars.length;
+    if (c1 <= c0) continue;
+    const pts = [[g.xs[c0], -g.size * 0.22], [g.xs[c1], -g.size * 0.22], [g.xs[c1], g.size * 0.9], [g.xs[c0], g.size * 0.9]]
+      .map(([lx, ly]) => O.toUser(g.x, g.y, g.rot, lx, ly));
+    const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+    out.push({ x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) });
+  }
+  return mergeRects(out);
+}
 
 function mergeRects(rs) {
   rs.sort((a, b) => b.y - a.y || a.x - b.x);
@@ -785,7 +856,7 @@ export function closeEditors(commit = true) {
   $$('.note-pop').forEach((n) => n._close?.());
 }
 
-function openTextEditor(v, o, isNew, { pairedWhiteout, snap: preSnap } = {}) {
+function openTextEditor(v, o, isNew, { pairedWhiteout, snap: preSnap, caret } = {}) {
   closeEditors();
   const s = v.vp.scale;
   const ta = document.createElement('textarea');
@@ -813,7 +884,10 @@ function openTextEditor(v, o, isNew, { pairedWhiteout, snap: preSnap } = {}) {
   // Live-apply font/colour changes from the property bar while editing.
   ta._apply = () => { Object.assign(ta.style, { font: `${o.italic ? 'italic ' : ''}${o.bold ? '700 ' : ''}${o.size * s}px/1.2 ${O.FONT_CSS[o.font]}`, color: o.color }); fit(); };
   ta._obj = o;
-  setTimeout(() => { ta.focus(); if (!isNew) ta.select(); }, 0);
+  // Focus now, inside the tap, so iOS raises the keyboard. Existing PDF text gets a caret where it was tapped.
+  const place = () => { if (caret != null) ta.setSelectionRange(caret, caret); else if (!isNew) ta.select(); };
+  ta.focus({ preventScroll: true }); place();
+  setTimeout(() => { if (document.activeElement !== ta) ta.focus({ preventScroll: true }); place(); }, 0);
   let finished = false;
   function done(commit) {
     if (finished) return;
@@ -916,13 +990,18 @@ function sampleColors(v, run) {
   return { fg, bg };
 }
 
-async function editExistingText(v, [ux, uy]) {
-  const runs = await textRuns(v.p);
+function editExistingText(v, pt) {
+  const runs = runCache.get(`${v.p.src}:${v.p.idx}`);
+  // Runs are prefetched when the page renders; if not ready yet, open after loading (desktop keyboards don't mind).
+  if (!runs) return textRuns(v.p).then(() => editExistingText(v, pt));
+  const [ux, uy] = pt;
+  let clickX = 0;
   const run = runs.find((r) => {
     const [lx, ly] = O.toLocal(r.x, r.y, r.rot, ux, uy);
+    clickX = lx;
     return lx >= -2 && lx <= r.w + 2 && ly >= -r.size * 0.3 && ly <= r.size;
   });
-  if (!run) { toast('No text there — click directly on a line of existing text.'); return; }
+  if (!run) { toast('No text there — tap directly on a line of existing text.'); return; }
   const poly = [[-1, -run.size * 0.28], [run.w + 1, -run.size * 0.28], [run.w + 1, run.size * 0.98], [-1, run.size * 0.98]].map(([lx, ly]) => O.toUser(run.x, run.y, run.rot, lx, ly));
   const xs = poly.map((q) => q[0]), ys = poly.map((q) => q[1]);
   const { fg, bg } = sampleColors(v, run);
@@ -932,7 +1011,18 @@ async function editExistingText(v, [ux, uy]) {
   // Put the replacement at the bottom of the stack so existing highlights/markup stay visible on top.
   v.p.objs.unshift(cover, txt);
   drawOverlay(v);
-  openTextEditor(v, txt, false, { pairedWhiteout: cover.id, snap });
+  openTextEditor(v, txt, false, { pairedWhiteout: cover.id, snap, caret: caretIn(run, clickX) });
+}
+
+// Character index in a run nearest a local x, measuring with the run's font and scaling to its real width.
+function caretIn(run, lx) {
+  measureCtx.font = `${run.italic ? 'italic ' : ''}${run.bold ? '700 ' : ''}100px ${O.FONT_CSS[run.font]}`;
+  const k = run.w / (measureCtx.measureText(run.text).width || 1);
+  let best = 0;
+  for (let i = 1; i <= run.text.length; i++) {
+    if (Math.abs(measureCtx.measureText(run.text.slice(0, i)).width * k - lx) < Math.abs(measureCtx.measureText(run.text.slice(0, best)).width * k - lx)) best = i;
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------- notes

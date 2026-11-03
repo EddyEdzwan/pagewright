@@ -59,26 +59,31 @@ exports.run = (win, app) => {
       await js(`const i = document.querySelector('.annotationLayer input'); i.focus(); i.value = 'Ada Lovelace';
         i.dispatchEvent(new Event('input', { bubbles: true })); i.dispatchEvent(new Event('change', { bubbles: true })); i.blur();`);
 
-      // ---- highlight real text via a DOM selection
+      // ---- highlight real text by dragging across it (snaps to characters)
       await js(`app.setTool('highlight');
-        const span = [...document.querySelectorAll('.pg .textLayer span')].find(s => s.textContent.includes('quick brown'));
-        const r = document.createRange(); r.selectNodeContents(span);
-        const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
-        document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+        const pg = document.querySelector('.pg'); const v = app.views.get(pg.dataset.uid); const b = pg.getBoundingClientRect();
+        const at = (x, y) => { const [vx, vy] = v.vp.convertToViewportPoint(x, y); return { bubbles: true, button: 0, clientX: b.left + vx, clientY: b.top + vy }; };
+        await new Promise(r => setTimeout(r, 200));
+        pg.querySelector('.hit').dispatchEvent(new PointerEvent('pointerdown', at(75, 645)));
+        window.dispatchEvent(new PointerEvent('pointermove', at(200, 646)));
+        window.dispatchEvent(new PointerEvent('pointerup', at(200, 646)));
         await new Promise(r => setTimeout(r, 50));`);
-      log(await js(`return app.S.pages[0].objs.some(o => o.type === 'highlight' && o.rects.length >= 1)`), 'highlight created from text selection');
+      log(await js(`const h = app.S.pages[0].objs.find(o => o.type === 'highlight'); return !!h && h.rects.length === 1 && h.rects[0].x > 70 && h.rects[0].w > 60 && h.rects[0].w < 150 && h.rects[0].h < 30`), `highlight snaps to dragged text (${await js('return JSON.stringify(app.S.pages[0].objs.find(o => o.type === "highlight")?.rects)')})`);
 
       // ---- edit existing text by clicking on it
       await js(`app.setTool('edittext');
         const pg = document.querySelector('.pg'); const v = app.views.get(pg.dataset.uid);
         const [vx, vy] = v.vp.convertToViewportPoint(100, 645); const b = pg.getBoundingClientRect();
-        pg.querySelector('.hit').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: b.left + vx, clientY: b.top + vy }));
+        const ev = { bubbles: true, button: 0, clientX: b.left + vx, clientY: b.top + vy };
+        pg.querySelector('.hit').dispatchEvent(new PointerEvent('pointerdown', ev));
+        window.dispatchEvent(new PointerEvent('pointerup', ev));
         await new Promise(r => setTimeout(r, 300));
         const ta = document.querySelector('.text-editor');
         if (!ta) throw new Error('no editor opened');
-        window.__orig = ta.value;
+        window.__orig = ta.value; window.__caret = ta.selectionStart;
         ta.value = ta.value.replace('brown', 'RED');
         ta.dispatchEvent(new Event('input'));`);
+      log(await js(`return window.__caret > 0 && window.__caret < 15 && document.activeElement?.classList.contains('text-editor')`), `edit-text focuses with caret at the tapped character (${await js('return window.__caret')})`);
       log(await js(`return window.__orig === 'The quick brown fox jumps over the lazy dog.'`), `edit-text picked up the original line ("${await js('return window.__orig')}")`);
       await shot('02-editing-text');
       await js(`app.closeEditors(); await new Promise(r => setTimeout(r, 50));`);
